@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "github.com/go-kit/kit/examples/grpc/bidi2/pb";
+
+service MyService {
+  rpc StreamData (stream Message) returns (stream Message);
+}
+
+message Message {
+  string message = 1;
+}
+
