@@ -14,38 +14,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-func wrapStreamEndpoint(streamEndpoint transportgrpc.StreamingEndpoint) endpoint.Endpoint {
-	return func(context.Context, interface{}) (interface{}, error) {
-		return streamEndpoint, nil
-	}
-}
-
-func streamEndpointFromEndpoint(e endpoint.Endpoint) transportgrpc.StreamingEndpoint {
-	se, _ := e(context.Background(), nil)
-	return se.(transportgrpc.StreamingEndpoint)
-}
-
-func svcFactory() sd.Factory {
-	return func(instance string) (endpoint.Endpoint, io.Closer, error) {
-		conn, err := grpc.Dial(instance, grpc.WithInsecure())
-		if err != nil {
-			return nil, nil, err
-		}
-		client := transportgrpc.NewStreamingClient(
-			conn,
-			"/pb.MyService/StreamData",
-			func(_ context.Context, req interface{}) (interface{}, error) {
-				return req.(*pb.Message), nil
-			},
-			func(_ context.Context, resp interface{}) (interface{}, error) {
-				return resp.(*pb.Message), nil
-			},
-			pb.Message{},
-		)
-		return wrapStreamEndpoint(client.StreamingEndpoint()), conn, nil
-	}
-}
-
 func main() {
 	instancer := sd.FixedInstancer([]string{"localhost:8080"})
 	factory := svcFactory()
@@ -77,4 +45,36 @@ func main() {
 			log.Println("Unexpected response type")
 		}
 	}
+}
+
+func svcFactory() sd.Factory {
+	return func(instance string) (endpoint.Endpoint, io.Closer, error) {
+		conn, err := grpc.Dial(instance, grpc.WithInsecure())
+		if err != nil {
+			return nil, nil, err
+		}
+		client := transportgrpc.NewStreamingClient(
+			conn,
+			"/pb.MyService/StreamData",
+			func(_ context.Context, req interface{}) (interface{}, error) {
+				return req.(*pb.Message), nil
+			},
+			func(_ context.Context, resp interface{}) (interface{}, error) {
+				return resp.(*pb.Message), nil
+			},
+			pb.Message{},
+		)
+		return wrapStreamEndpoint(client.StreamingEndpoint()), conn, nil
+	}
+}
+
+func wrapStreamEndpoint(streamEndpoint transportgrpc.StreamingEndpoint) endpoint.Endpoint {
+	return func(context.Context, interface{}) (interface{}, error) {
+		return streamEndpoint, nil
+	}
+}
+
+func streamEndpointFromEndpoint(e endpoint.Endpoint) transportgrpc.StreamingEndpoint {
+	se, _ := e(context.Background(), nil)
+	return se.(transportgrpc.StreamingEndpoint)
 }
