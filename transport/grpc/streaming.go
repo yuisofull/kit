@@ -232,8 +232,6 @@ func StreamingServerErrorEncoder(errorEncoder ServerStreamErrorEncoder) Streamin
 	return func(s *StreamingServer) { s.errorEncoder = errorEncoder }
 }
 
-// ServeGRPCStream is the gRPC server handler for bidirectional streaming.
-// It is intended to be used as the implementation of a gRPC streaming method.
 func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.ServerStream) (context.Context, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
