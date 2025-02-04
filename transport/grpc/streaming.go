@@ -15,30 +15,16 @@ import (
 // ----------------------------------------------------------------------
 // Client side
 
-// EncodeStreamRequestFunc encodes a user-domain request message into a
-// gRPC message. In a streaming context each message is encoded individually.
 type EncodeStreamRequestFunc func(context.Context, interface{}) (interface{}, error)
 
-// DecodeStreamResponseFunc decodes a gRPC message into a user-domain response.
 type DecodeStreamResponseFunc func(context.Context, interface{}) (interface{}, error)
 
-// ClientStreamRequestFunc allows one to modify the context before sending
-// each outgoing message.
 type ClientStreamRequestFunc func(context.Context, *metadata.MD) context.Context
 
-// ClientStreamResponseFunc allows one to modify the context after receiving
-// each response message.
 type ClientStreamResponseFunc func(ctx context.Context, header *metadata.MD, trailer *metadata.MD) context.Context
 
-// StreamingEndpoint is a function which, given a context and a channel of
-// request messages, returns a channel of response messages (or error).
-//
-// This is distinct from the usual endpoint.Endpoint type.
 type StreamingEndpoint func(ctx context.Context, req <-chan interface{}) (<-chan interface{}, error)
 
-// StreamingClient implements a bidirectional gRPC streaming client transport.
-// It creates a new gRPC stream, sends messages from a supplied request channel,
-// and publishes responses onto an output channel.
 type StreamingClient struct {
 	client   *grpc.ClientConn
 	method   string
@@ -49,7 +35,6 @@ type StreamingClient struct {
 	after    []ClientStreamResponseFunc
 }
 
-// NewStreamingClient constructs a new StreamingClient.
 func NewStreamingClient(
 	cc *grpc.ClientConn,
 	method string,
@@ -77,22 +62,14 @@ func NewStreamingClient(
 
 type StreamingClientOption func(*StreamingClient)
 
-// StreamingClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
-// request before it's invoked.
 func StreamingClientBefore(before ...ClientStreamRequestFunc) StreamingClientOption {
 	return func(c *StreamingClient) { c.before = append(c.before, before...) }
 }
 
-// StreamingClientAfter sets the ClientResponseFuncs that are applied to the incoming
-// gRPC response prior to it being decoded. This is useful for obtaining response
-// metadata and adding onto the context prior to decoding.
 func StreamingClientAfter(after ...ClientStreamResponseFunc) StreamingClientOption {
 	return func(c *StreamingClient) { c.after = append(c.after, after...) }
 }
 
-// StreamingEndpoint returns a StreamingEndpoint function which, when invoked
-// with a context and a channel of request messages, creates a gRPC bidirectional
-// stream and manages sending and receiving messages.
 func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 	return func(ctx context.Context, reqCh <-chan interface{}) (<-chan interface{}, error) {
 		desc := &grpc.StreamDesc{
@@ -171,7 +148,6 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 					return
 				}
 
-				//msg := reflect.ValueOf(msgPtr).Elem().Interface()
 				decoded, err := c.dec(headerCtx, msgPtr)
 				if err != nil {
 					outCh <- fmt.Errorf("decode error: %w", err)
@@ -188,28 +164,16 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 // ----------------------------------------------------------------------
 // Server side
 
-// DecodeStreamRequestFunc decodes an incoming gRPC message into a
-// user-domain request message.
 type DecodeStreamRequestFunc func(context.Context, interface{}) (interface{}, error)
 
-// EncodeStreamResponseFunc encodes a user-domain response message into a
-// gRPC message.
 type EncodeStreamResponseFunc func(context.Context, interface{}) (interface{}, error)
 
-// ServerStreamRequestFunc allows one to modify the context after receiving
-// each message from the stream.
 type ServerStreamRequestFunc func(context.Context, metadata.MD) context.Context
 
-// ServerStreamResponseFunc allows one to modify the context before sending
-// each response message.
 type ServerStreamResponseFunc func(ctx context.Context, header *metadata.MD, trailer *metadata.MD) context.Context
 
-// ServerStreamErrorEncoder encodes an error onto the gRPC stream.
-// (You might choose to log the error and/or send a specific error message.)
 type ServerStreamErrorEncoder func(ctx context.Context, err error, stream grpc.ServerStream)
 
-// StreamingServer implements a bidirectional streaming gRPC server transport.
-// It wraps a StreamingEndpoint along with decoder/encoder functions.
 type StreamingServer struct {
 	endpoint     StreamingEndpoint
 	dec          DecodeStreamRequestFunc
@@ -225,7 +189,6 @@ type StreamingHandler interface {
 	ServeGRPCStream(ctx context.Context, stream grpc.ServerStream) (retctx context.Context, err error)
 }
 
-// NewStreamingServer constructs a new StreamingServer.
 func NewStreamingServer(
 	endpoint StreamingEndpoint,
 	dec DecodeStreamRequestFunc,
