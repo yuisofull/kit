@@ -53,6 +53,7 @@ func svcFactory() sd.Factory {
 		if err != nil {
 			return nil, nil, err
 		}
+
 		client := transportgrpc.NewStreamingClient(
 			conn,
 			"/pb.MyService/StreamData",
@@ -63,7 +64,9 @@ func svcFactory() sd.Factory {
 				return resp.(*pb.Message), nil
 			},
 			pb.Message{},
+			pb.MyService_ServiceDesc,
 		)
+
 		return wrapStreamEndpoint(client.StreamingEndpoint()), conn, nil
 	}
 }
