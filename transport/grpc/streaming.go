@@ -12,27 +12,31 @@ import (
 	"google.golang.org/grpc"
 )
 
-// ----------------------------------------------------------------------
-// Client side
-
 type EncodeStreamRequestFunc func(context.Context, interface{}) (interface{}, error)
 
 type DecodeStreamResponseFunc func(context.Context, interface{}) (interface{}, error)
 
 type ClientStreamRequestFunc func(context.Context, *metadata.MD) context.Context
 
-type ClientStreamResponseFunc func(ctx context.Context, header *metadata.MD, trailer *metadata.MD) context.Context
+type ClientStreamHeaderResponseFunc func(ctx context.Context, header *metadata.MD) context.Context
 
-type StreamingEndpoint func(ctx context.Context, req <-chan interface{}) (<-chan interface{}, error)
+type ClientStreamTrailerResponseFunc func(ctx context.Context, trailer *metadata.MD) context.Context
+
+type ClientStreamFinalizerFunc func(ctx context.Context, err error)
+
+type StreamingEndpoint func(ctx context.Context, req <-chan interface{}) (resp <-chan interface{}, err error)
 
 type StreamingClient struct {
-	client   *grpc.ClientConn
-	method   string
-	enc      EncodeStreamRequestFunc
-	dec      DecodeStreamResponseFunc
-	grpcResp reflect.Type
-	before   []ClientStreamRequestFunc
-	after    []ClientStreamResponseFunc
+	client      *grpc.ClientConn
+	method      string
+	enc         EncodeStreamRequestFunc
+	dec         DecodeStreamResponseFunc
+	grpcResp    reflect.Type
+	serviceDesc grpc.ServiceDesc
+	before      []ClientStreamRequestFunc
+	onHeader    []ClientStreamHeaderResponseFunc
+	onTrailer   []ClientStreamTrailerResponseFunc
+	finalizer   []ClientStreamFinalizerFunc
 }
 
 func NewStreamingClient(
@@ -41,6 +45,7 @@ func NewStreamingClient(
 	enc EncodeStreamRequestFunc,
 	dec DecodeStreamResponseFunc,
 	grpcResp interface{},
+	serviceDesc grpc.ServiceDesc,
 	options ...StreamingClientOption,
 ) *StreamingClient {
 	sc := &StreamingClient{
@@ -53,6 +58,7 @@ func NewStreamingClient(
 				reflect.ValueOf(grpcResp),
 			).Interface(),
 		),
+		serviceDesc: serviceDesc,
 	}
 	for _, option := range options {
 		option(sc)
@@ -66,98 +72,103 @@ func StreamingClientBefore(before ...ClientStreamRequestFunc) StreamingClientOpt
 	return func(c *StreamingClient) { c.before = append(c.before, before...) }
 }
 
-func StreamingClientAfter(after ...ClientStreamResponseFunc) StreamingClientOption {
-	return func(c *StreamingClient) { c.after = append(c.after, after...) }
+func StreamingClientOnHeader(onHeader ...ClientStreamHeaderResponseFunc) StreamingClientOption {
+	return func(c *StreamingClient) { c.onHeader = append(c.onHeader, onHeader...) }
+}
+func StreamingClientOnTrailer(onTrailer ...ClientStreamTrailerResponseFunc) StreamingClientOption {
+	return func(c *StreamingClient) { c.onTrailer = append(c.onTrailer, onTrailer...) }
 }
 
 func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 	return func(ctx context.Context, reqCh <-chan interface{}) (<-chan interface{}, error) {
-		desc := &grpc.StreamDesc{
-			ServerStreams: true,
-			ClientStreams: true,
+		var err error
+
+		if c.finalizer != nil {
+			defer func() {
+				for _, f := range c.finalizer {
+					f(ctx, err)
+				}
+			}()
 		}
+
+		ctx = context.WithValue(ctx, ContextKeyRequestMethod, c.method)
+
 		md := &metadata.MD{}
 		for _, f := range c.before {
 			ctx = f(ctx, md)
 		}
+
 		ctx = metadata.NewOutgoingContext(ctx, *md)
 
-		stream, err := c.client.NewStream(ctx, desc, c.method)
+		stream, err := c.client.NewStream(ctx, &c.serviceDesc.Streams[0], c.method)
 		if err != nil {
 			return nil, err
 		}
-		outCh := make(chan interface{})
 
-		headerCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		headerChan := make(chan metadata.MD, 1)
-
-		go func() {
-			defer close(headerChan)
-			header, err := stream.Header()
-			if err != nil {
-				outCh <- err
-				return
-			}
-			headerChan <- header
-		}()
+		respCh := make(chan interface{})
 
 		go func() {
 			defer func() {
-				_ = stream.CloseSend()
+				if err := stream.CloseSend(); err != nil {
+					respCh <- fmt.Errorf("close send error: %w", err)
+					return
+				}
 			}()
-
 			for req := range reqCh {
 				msg, err := c.enc(ctx, req)
 				if err != nil {
-					outCh <- fmt.Errorf("encoding error: %w", err)
+					respCh <- fmt.Errorf("encoding error: %w", err)
 					return
 				}
 				if err := stream.SendMsg(msg); err != nil {
-					outCh <- fmt.Errorf("send error: %w", err)
+					if err == io.EOF {
+						// If the stream is closed, we can exit gracefully.
+						return
+					}
+					respCh <- fmt.Errorf("send error: %w", err)
 					return
 				}
 			}
 		}()
 
 		go func() {
-			defer close(outCh)
+			defer close(respCh)
 
 			var header, trailer metadata.MD
 
-			for {
-				select {
-				case h := <-headerChan:
-					header = h
-					for _, f := range c.after {
-						headerCtx = f(headerCtx, &header, &trailer)
-					}
-				case <-ctx.Done():
-					return
-				default:
-				}
+			if header, err = stream.Header(); err != nil {
+				respCh <- fmt.Errorf("header error: %w", err)
+				return
+			}
 
+			for _, f := range c.onHeader {
+				ctx = f(ctx, &header)
+			}
+
+			for {
 				msgPtr := reflect.New(c.grpcResp).Interface()
 				if err := stream.RecvMsg(msgPtr); err != nil {
 					if err == io.EOF {
 						trailer = stream.Trailer()
+						for _, f := range c.onTrailer {
+							ctx = f(ctx, &trailer)
+						}
 						return
 					}
-					outCh <- fmt.Errorf("receive error: %w", err)
+					respCh <- fmt.Errorf("receive error: %w", err)
 					return
 				}
 
-				decoded, err := c.dec(headerCtx, msgPtr)
+				decoded, err := c.dec(ctx, msgPtr)
 				if err != nil {
-					outCh <- fmt.Errorf("decode error: %w", err)
+					respCh <- fmt.Errorf("decode error: %w", err)
 					return
 				}
-				outCh <- decoded
+				respCh <- decoded
 			}
 		}()
 
-		return outCh, nil
+		return respCh, nil
 	}
 }
 
