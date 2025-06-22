@@ -5,7 +5,6 @@ package grpc
 
 import (
 	"context"
-	"fmt"
 	"github.com/go-kit/log"
 	"google.golang.org/grpc/metadata"
 	"io"
@@ -14,6 +13,11 @@ import (
 	"github.com/go-kit/kit/transport"
 	"google.golang.org/grpc"
 )
+
+type StreamMessage struct {
+	Message interface{}
+	Err     error
+}
 
 // EncodeStreamRequestFunc encodes a single request object into a gRPC stream message.
 // It's used by streaming clients to encode requests before sending them over the stream.
@@ -41,7 +45,7 @@ type ClientStreamFinalizerFunc func(ctx context.Context, err error)
 
 // StreamingEndpoint represents a streaming endpoint that accepts a channel of requests
 // and returns a channel of responses. This allows for bidirectional streaming communication.
-type StreamingEndpoint func(ctx context.Context, req <-chan interface{}) (resp <-chan interface{}, err error)
+type StreamingEndpoint func(ctx context.Context, req <-chan interface{}) (resp <-chan StreamMessage, err error)
 
 // StreamingClient wraps a gRPC connection and provides streaming functionality.
 // It handles the complexities of gRPC streaming while providing a channel-based interface.
@@ -113,7 +117,7 @@ func StreamingClientOnTrailer(onTrailer ...ClientStreamTrailerResponseFunc) Stre
 // The returned endpoint accepts a channel of requests and returns a channel of responses,
 // managing the underlying gRPC stream operations transparently.
 func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
-	return func(ctx context.Context, reqCh <-chan interface{}) (<-chan interface{}, error) {
+	return func(ctx context.Context, reqCh <-chan interface{}) (<-chan StreamMessage, error) {
 		var err error
 
 		// Execute finalizer functions when the endpoint completes
@@ -142,20 +146,20 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 			return nil, err
 		}
 
-		respCh := make(chan interface{})
+		respCh := make(chan StreamMessage)
 
 		// Goroutine to handle sending requests
 		go func() {
 			defer func() {
 				if err := stream.CloseSend(); err != nil {
-					respCh <- fmt.Errorf("close send error: %w", err)
+					respCh <- StreamMessage{Err: err}
 					return
 				}
 			}()
 			for req := range reqCh {
 				msg, err := c.enc(ctx, req)
 				if err != nil {
-					respCh <- fmt.Errorf("encoding error: %w", err)
+					respCh <- StreamMessage{Err: err}
 					return
 				}
 				if err := stream.SendMsg(msg); err != nil {
@@ -163,8 +167,7 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 						// If the stream is closed, we can exit gracefully.
 						return
 					}
-					respCh <- fmt.Errorf("send error: %w", err)
-					return
+					respCh <- StreamMessage{Err: err}
 				}
 			}
 		}()
@@ -177,7 +180,7 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 
 			// Process stream headers
 			if header, err = stream.Header(); err != nil {
-				respCh <- fmt.Errorf("header error: %w", err)
+				respCh <- StreamMessage{Err: err}
 				return
 			}
 
@@ -189,24 +192,24 @@ func (c *StreamingClient) StreamingEndpoint() StreamingEndpoint {
 			for {
 				msgPtr := reflect.New(c.grpcResp).Interface()
 				if err := stream.RecvMsg(msgPtr); err != nil {
+					// Process stream trailers when the stream ends
+					trailer = stream.Trailer()
+					for _, f := range c.onTrailer {
+						ctx = f(ctx, &trailer)
+					}
 					if err == io.EOF {
-						// Process stream trailers when the stream ends
-						trailer = stream.Trailer()
-						for _, f := range c.onTrailer {
-							ctx = f(ctx, &trailer)
-						}
 						return
 					}
-					respCh <- fmt.Errorf("receive error: %w", err)
+					respCh <- StreamMessage{Err: err}
 					return
 				}
 
 				decoded, err := c.dec(ctx, msgPtr)
 				if err != nil {
-					respCh <- fmt.Errorf("decode error: %w", err)
+					respCh <- StreamMessage{Err: err}
 					return
 				}
-				respCh <- decoded
+				respCh <- StreamMessage{Message: decoded}
 			}
 		}()
 
@@ -230,21 +233,21 @@ type ServerStreamRequestFunc func(context.Context, metadata.MD) context.Context
 // It allows modification of response headers and trailers.
 type ServerStreamResponseFunc func(ctx context.Context, header *metadata.MD, trailer *metadata.MD) context.Context
 
-// ServerStreamErrorEncoder handles errors that occur during stream processing.
-// It allows custom error handling and response formatting for streaming operations.
-type ServerStreamErrorEncoder func(ctx context.Context, err error, stream grpc.ServerStream)
+// ServerStreamFinalizerFunc can be used to perform work at the end of gRPC
+// streaming, after the stream is aborted.
+type ServerStreamFinalizerFunc func(ctx context.Context, err error)
 
 // StreamingServer wraps a StreamingEndpoint and implements streaming gRPC server functionality.
 // It handles the complexities of gRPC server streaming while providing a channel-based interface.
 type StreamingServer struct {
-	endpoint     StreamingEndpoint          // The business logic endpoint
-	dec          DecodeStreamRequestFunc    // Function to decode requests
-	enc          EncodeStreamResponseFunc   // Function to encode responses
-	grpcReqType  reflect.Type               // Type of the gRPC request message
-	before       []ServerStreamRequestFunc  // Functions executed before processing requests
-	after        []ServerStreamResponseFunc // Functions executed before sending responses
-	errorEncoder ServerStreamErrorEncoder   // Function to handle stream errors
-	errorHandler transport.ErrorHandler     // General error handler
+	endpoint     StreamingEndpoint           // The business logic endpoint
+	dec          DecodeStreamRequestFunc     // Function to decode requests
+	enc          EncodeStreamResponseFunc    // Function to encode responses
+	grpcReqType  reflect.Type                // Type of the gRPC request message
+	before       []ServerStreamRequestFunc   // Functions executed before processing requests
+	after        []ServerStreamResponseFunc  // Functions executed before sending responses
+	errorHandler transport.ErrorHandler      // General error handler
+	finalizer    []ServerStreamFinalizerFunc // finalizer defines functions to be executed at the end of gRPC streaming.
 }
 
 // StreamingHandler defines the interface for gRPC streaming handlers.
@@ -272,7 +275,6 @@ func NewStreamingServer(
 				reflect.ValueOf(grpcReq),
 			).Interface(),
 		),
-		errorEncoder: func(ctx context.Context, err error, stream grpc.ServerStream) {},
 		errorHandler: transport.NewLogErrorHandler(log.NewNopLogger()),
 	}
 	for _, option := range options {
@@ -302,22 +304,33 @@ func StreamingServerErrorHandler(errorHandler transport.ErrorHandler) StreamingS
 	return func(s *StreamingServer) { s.errorHandler = errorHandler }
 }
 
-// StreamingServerErrorEncoder sets the error encoder for stream-specific error handling.
-// This allows custom error responses to be sent over the stream.
-func StreamingServerErrorEncoder(errorEncoder ServerStreamErrorEncoder) StreamingServerOption {
-	return func(s *StreamingServer) { s.errorEncoder = errorEncoder }
+// ServerStreamFinalizer is executed at the end of gRPC streaming.
+// By default, no finalizer is registered.
+func ServerStreamFinalizer(finalizer ...ServerStreamFinalizerFunc) StreamingServerOption {
+	return func(s *StreamingServer) { s.finalizer = append(s.finalizer, finalizer...) }
 }
 
 // ServeGRPCStream implements the StreamingHandler interface.
 // It handles incoming gRPC streams by converting them to channel-based communication
 // and delegating to the configured StreamingEndpoint.
-func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.ServerStream) (context.Context, error) {
+func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.ServerStream) (retctx context.Context, err error) {
 	// Extract metadata from the incoming context
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		md = metadata.MD{}
 	}
+
+	if len(s.finalizer) > 0 {
+		defer func() {
+			for _, f := range s.finalizer {
+				f(ctx, err)
+			}
+		}()
+	}
+
 	reqCh := make(chan interface{})
+
+	errCh := make(chan error)
 
 	// Goroutine to handle receiving requests from the stream
 	go func() {
@@ -328,8 +341,7 @@ func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.Serve
 				if err == io.EOF {
 					return // Stream closed normally
 				}
-				s.errorHandler.Handle(ctx, err)
-				s.errorEncoder(ctx, err, stream)
+				errCh <- err
 				return
 			}
 
@@ -339,8 +351,7 @@ func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.Serve
 			}
 			decoded, err := s.dec(ctx, msgPtr)
 			if err != nil {
-				s.errorHandler.Handle(ctx, err)
-				s.errorEncoder(ctx, err, stream)
+				errCh <- err
 				return
 			}
 			reqCh <- decoded
@@ -351,7 +362,6 @@ func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.Serve
 	respCh, err := s.endpoint(ctx, reqCh)
 	if err != nil {
 		s.errorHandler.Handle(ctx, err)
-		s.errorEncoder(ctx, err, stream)
 		return ctx, err
 	}
 
@@ -374,19 +384,29 @@ func (s *StreamingServer) ServeGRPCStream(ctx context.Context, stream grpc.Serve
 		}
 	}
 
-	// Send responses over the stream
-	for resp := range respCh {
-		encoded, err := s.enc(ctx, resp)
-		if err != nil {
+	for {
+		select {
+		case err := <-errCh:
 			s.errorHandler.Handle(ctx, err)
-			s.errorEncoder(ctx, err, stream)
 			return ctx, err
-		}
-		if err := stream.SendMsg(encoded); err != nil {
-			s.errorHandler.Handle(ctx, err)
-			s.errorEncoder(ctx, err, stream)
-			return ctx, err
+		case resp, ok := <-respCh:
+			if !ok {
+				return ctx, nil
+			}
+			if resp.Err != nil {
+				s.errorHandler.Handle(ctx, resp.Err)
+				return ctx, resp.Err
+			}
+
+			encoded, err := s.enc(ctx, resp.Message)
+			if err != nil {
+				s.errorHandler.Handle(ctx, err)
+				return ctx, err
+			}
+			if err := stream.SendMsg(encoded); err != nil {
+				s.errorHandler.Handle(ctx, err)
+				return ctx, err
+			}
 		}
 	}
-	return ctx, nil
 }
